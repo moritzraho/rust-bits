@@ -1,6 +1,6 @@
 // block cipher, column-major 4x4 matrix stored in an array
 #[derive(Debug, Clone)]
-pub struct Block([u8; 16]);
+pub struct Block(pub(crate) [u8; 16]);
 impl Block {
     // matrix is column-major here: matrix[col][row], matching the aes convention. Each entry is a byte.
     pub fn from_matrix(matrix: [[u8; 4]; 4]) -> Self {
@@ -33,6 +33,10 @@ impl Block {
             new_matrix[i / 4][i % 4] = self.0[i];
         }
         new_matrix
+    }
+
+    pub fn as_bytes(&self) -> [u8; 16] {
+        self.0.clone()
     }
 
     // add round key with xor operation - a.k.a Rijndael galois field addition
@@ -137,10 +141,8 @@ impl Block {
     }
 
     // https://github.com/francisrstokes/githublog/blob/main/2022/6/15/rolling-your-own-crypto-aes.md#operations-and-transformations
-    pub fn encrypt(&mut self, key: &[u8]) {
-        // generate round keys
-        let round_keys = expand_keys(key);
-
+    // we use a Vec that can be of size AES_ROUNDS_128=11, AES_ROUNDS_192=13 or  AES_ROUNDS_256=15
+    pub fn encrypt(&mut self, round_keys: &Vec<Block>) {
         // round 1
         self.add_round_key(&round_keys[0]);
 
@@ -158,10 +160,8 @@ impl Block {
         self.add_round_key(&round_keys[round_keys.len() - 1]);
     }
 
-    pub fn decrypt(&mut self, key: &[u8]) {
-        // generate round keys
-        let round_keys = expand_keys(key);
-
+    // we use a Vec that can be of size AES_ROUNDS_128=11, AES_ROUNDS_192=13 or  AES_ROUNDS_256=15
+    pub fn decrypt(&mut self, round_keys: &Vec<Block>) {
         // last round
         self.add_round_key(&round_keys[round_keys.len() - 1]);
         self.inv_shift_rows();
@@ -178,6 +178,50 @@ impl Block {
         // round 1
         self.add_round_key(&round_keys[0]);
     }
+}
+
+// TODO: look into integrity protection
+pub fn encrypt_cbc(clear: &[u8], key: &[u8], iv: &[u8; 16]) -> Vec<u8> {
+    let padded_clear = pkcs7_pad(clear);
+    let blocks = padded_clear.len() / 16;
+
+    let mut iv_and_result = Vec::from(iv);
+    let round_keys = expand_keys(key);
+
+    for b in 0..blocks {
+        let enc_b = Block::from_bytes(&padded_clear[b * 16..(b + 1) * 16].try_into().unwrap());
+        let mut proc_b = enc_b.clone();
+
+        for i in 0..16 {
+            proc_b.0[i] = proc_b.0[i] ^ &iv_and_result[b * 16 + i]
+        }
+
+        proc_b.encrypt(&round_keys);
+        iv_and_result.extend(&proc_b.0.clone());
+    }
+
+    return iv_and_result[16..].to_vec();
+}
+pub fn decrypt_cbc(cipher: &[u8], key: &[u8], iv: &[u8; 16]) -> Vec<u8> {
+    let blocks = cipher.len() / 16;
+
+    let mut result: Vec<u8> = Vec::new();
+
+    let iv_and_cipher = [iv, cipher].concat();
+    let round_keys = expand_keys(key);
+
+    for b in 1..=blocks {
+        let enc_b = Block::from_bytes(&iv_and_cipher[b * 16..(b + 1) * 16].try_into().unwrap());
+        let mut proc_b = enc_b.clone();
+        proc_b.decrypt(&round_keys);
+
+        for i in 0..16 {
+            proc_b.0[i] = proc_b.0[i] ^ &iv_and_cipher[(b - 1) * 16 + i]
+        }
+
+        result.extend(proc_b.0.to_vec());
+    }
+    return pkcs7_unpad(&result).unwrap();
 }
 
 // for simplicity we return a Vec that can be of size AES_ROUNDS_128=11, AES_ROUNDS_192=13 or  AES_ROUNDS_256=15
@@ -259,6 +303,28 @@ pub fn expand_keys(key: &[u8]) -> Vec<Block> {
         .collect()
 }
 
+fn pkcs7_pad(data: &[u8]) -> Vec<u8> {
+    let pad = 16 - (data.len() % 16);
+    let mut out = data.to_vec();
+    out.extend(std::iter::repeat(pad as u8).take(pad));
+    out
+}
+
+fn pkcs7_unpad(data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if data.is_empty() || data.len() % 16 != 0 {
+        return Err("invalid ciphertext length");
+    }
+    let pad = *data.last().unwrap() as usize;
+    if pad == 0 || pad > 16 {
+        return Err("invalid padding");
+    }
+    let start = data.len() - pad;
+    if !data[start..].iter().all(|&b| b as usize == pad) {
+        return Err("invalid padding");
+    }
+    Ok(data[..start].to_vec())
+}
+
 /// Multiply by 2 in GF(2^8) using the AES reduction polynomial (x^8 + x^4 + x^3 + x + 1).
 #[inline]
 fn galois_mul2(x: u8) -> u8 {
@@ -324,15 +390,16 @@ mod tests {
         let key = [0u8; 16];
         let mut block = Block::from_text("Hello, AES-128!!");
         let original = block.to_matrix();
+        let round_keys = expand_keys(&key);
 
-        block.encrypt(&key);
+        block.encrypt(&round_keys);
         assert_ne!(
             block.to_matrix(),
             original,
             "ciphertext should differ from plaintext"
         );
 
-        block.decrypt(&key);
+        block.decrypt(&round_keys);
         assert_eq!(
             block.to_matrix(),
             original,
@@ -345,9 +412,10 @@ mod tests {
         let key = [1u8; 24];
         let mut block = Block::from_text("Hello, AES-192!!");
         let original = block.to_matrix();
+        let round_keys = expand_keys(&key);
 
-        block.encrypt(&key);
-        block.decrypt(&key);
+        block.encrypt(&round_keys);
+        block.decrypt(&round_keys);
         assert_eq!(block.to_matrix(), original);
     }
 
@@ -356,10 +424,24 @@ mod tests {
         let key = [2u8; 32];
         let mut block = Block::from_text("Hello, AES-256!!");
         let original = block.to_matrix();
+        let round_keys = expand_keys(&key);
 
-        block.encrypt(&key);
-        block.decrypt(&key);
+        block.encrypt(&round_keys);
+        block.decrypt(&round_keys);
         assert_eq!(block.to_matrix(), original);
+    }
+
+    // --- simple cbc roundtrip -------------
+    #[test]
+    fn roundtrip_cbc_256() {
+        let key = [2u8; 32];
+        let iv = [3u8; 16];
+        let clear = b"hi Alice this is a toy implementation, make sure to never ever use it in production! Best Regards, Bob";
+
+        assert_eq!(
+            decrypt_cbc(&encrypt_cbc(clear, &key, &iv), &key, &iv),
+            clear,
+        );
     }
 
     // --- known-answer test (FIPS-197 Appendix B, AES-128) -------------
@@ -379,7 +461,8 @@ mod tests {
             .unwrap();
 
         let mut block = Block::from_bytes(&plaintext);
-        block.encrypt(&key);
+        let round_keys = expand_keys(&key);
+        block.encrypt(&round_keys);
 
         // Reconstruct raw bytes from the (row-major) matrix representation
         // to compare against the expected ciphertext bytes.
@@ -392,7 +475,7 @@ mod tests {
 
         // and decrypting the known ciphertext should return the known plaintext
         let mut decrypt_block = Block::from_bytes(&expected_ct);
-        decrypt_block.decrypt(&key);
+        decrypt_block.decrypt(&round_keys);
         let dmatrix = decrypt_block.to_matrix();
         let mut pt = [0u8; 16];
         for i in 0..16 {
@@ -408,8 +491,9 @@ mod tests {
         let mut a = Block::from_text("Same plaintext!!");
         let mut b = Block::from_text("Same plaintext!!");
 
-        a.encrypt(&[0u8; 16]);
-        b.encrypt(&[1u8; 16]);
+        let round_keys = expand_keys(&[0u8; 16]);
+        a.encrypt(&expand_keys(&[0u8; 16]));
+        b.encrypt(&expand_keys(&[1u8; 16]));
 
         assert_ne!(a.to_matrix(), b.to_matrix());
     }
